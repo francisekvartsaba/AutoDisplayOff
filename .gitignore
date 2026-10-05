@@ -1,0 +1,14 @@
+# Swift Package Manager / build output
+.build/
+.swiftpm/
+DerivedData/
+Package.resolved
+
+# Packaged app (build it yourself with ./package_app.sh)
+AutoDisplayOff.app/
+*.zip
+
+# macOS / Xcode
+.DS_Store
+xcuserdata/
+*.xcuserstate
