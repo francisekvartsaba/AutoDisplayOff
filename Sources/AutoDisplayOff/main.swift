@@ -1,44 +1,45 @@
 //
 // AutoDisplayOff
 //
-// Menu-bar utility for macOS that automatically switches the built-in
-// display OFF (not just black — actually disabled at the WindowServer
-// level, same as real clamshell mode) whenever an external display is
-// connected, and switches it back ON when the external display is
-// removed. Unlike closing the lid, the keyboard/trackpad keep working
-// and the lid can stay open the whole time.
+// Menu-bar utility for macOS that lets you choose which display is ON when an
+// external monitor is connected to a MacBook:
 //
-// Click the menu-bar icon to open a small window with the current
-// status, a switch to turn the automatic behaviour on/off, and a
-// manual "toggle now" button.
+//   * "Ноутбук / Laptop"  – only the built-in display is on (external ones off)
+//   * "Монитор / Monitor" – only the external display(s) are on (built-in off)
+//   * "Оба / Both"        – everything is on
+//
+// "Off" means really disabled at the WindowServer level (like clamshell mode),
+// not just black or dimmed. The lid can stay open and the keyboard and
+// trackpad keep working.
+//
+// In automatic mode the app switches to "Monitor" whenever a new external
+// display is connected. Click the menu-bar icon to open the window with the
+// screen selector and the automatic-mode switch.
 //
 // HOW IT WORKS
 // ------------
-// macOS has no public API for "disable this one display but keep the
-// lid open". The mechanism used here — SLSConfigureDisplayEnabled /
-// CGSConfigureDisplayEnabled — is a *private*, undocumented API from
-// SkyLight.framework (WindowServer's private framework). It is the same
-// primitive that professional display-management utilities have relied
-// on for years to fully power down a display's output. Being private:
+// macOS has no public API for "disable this one display". The mechanism used
+// here — SLSConfigureDisplayEnabled / CGSConfigureDisplayEnabled — is a
+// *private*, undocumented API from SkyLight.framework. Being private:
 //   * it needs no special entitlement or code signature to call,
 //   * but Apple can change or remove it in any macOS release,
 //   * and it is not eligible for Mac App Store distribution.
-// This is an accepted, understood trade-off for a personal utility —
-// not a bug in this implementation.
 //
 // SAFETY
 // ------
-// If we ever disable the internal display and then lose track of the
-// external one (crash, quit, cable pulled at the wrong instant), the
-// user must not be left staring at a black laptop screen with no way
-// to get it back. To guard against that this app:
-//   1. Immediately re-enables the internal display the moment the
-//      external display count drops to zero.
-//   2. Re-enables the internal display on normal or abnormal quit, and
-//      whenever the automatic mode is switched off.
-//   3. Runs a periodic safety-check timer that force-restores the
-//      internal display if it is off but no external display is
-//      present (covers races the reconfiguration callback might miss).
+// The app must never leave the user without a working display. To guard
+// against that:
+//   1. Every switch first turns the needed displays ON and only then turns
+//      the others OFF, and it never turns off the last display that is on.
+//   2. If the built-in display is off and no external display is left (the
+//      monitor was unplugged), everything is switched back on (after ~1.5 s).
+//   3. On quit (Quit button, SIGTERM from `pkill`, logout) everything is
+//      switched back on.
+//   4. The list of displays switched off by the app is saved to
+//      ~/Library/Application Support/AutoDisplayOff/state.json and restored on
+//      the next launch, so even after a crash or `kill -9` simply starting
+//      the app again brings the displays back.
+//   5. A background check every 15 s re-evaluates the situation.
 //
 import AppKit
 import SwiftUI
@@ -80,8 +81,6 @@ private func setDisplay(_ displayID: CGDirectDisplayID, enabled: Bool) -> Bool {
     return CGCompleteDisplayConfiguration(config, .forSession) == .success
 }
 
-// MARK: - Display enumeration helpers
-
 private func onlineDisplayIDs() -> [CGDirectDisplayID] {
     var count: UInt32 = 0
     CGGetOnlineDisplayList(0, nil, &count)
@@ -91,12 +90,33 @@ private func onlineDisplayIDs() -> [CGDirectDisplayID] {
     return ids
 }
 
-private func internalDisplayID() -> CGDirectDisplayID? {
-    onlineDisplayIDs().first { CGDisplayIsBuiltin($0) != 0 }
+// MARK: - Persisted state (crash recovery)
+
+private struct SavedState: Codable {
+    var internalID: UInt32?
+    var offByUs: [UInt32]
 }
 
-private func externalDisplayCount(excluding builtinID: CGDirectDisplayID?) -> Int {
-    onlineDisplayIDs().filter { $0 != builtinID && CGDisplayIsBuiltin($0) == 0 }.count
+private enum StateStore {
+    static var url: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base
+            .appendingPathComponent("AutoDisplayOff", isDirectory: true)
+            .appendingPathComponent("state.json")
+    }
+
+    static func load() -> SavedState? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(SavedState.self, from: data)
+    }
+
+    static func save(_ state: SavedState) {
+        let dir = url.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(state) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
 }
 
 // MARK: - Reconfiguration callback (must be a plain C function, not a closure)
@@ -114,130 +134,304 @@ private func reconfigurationCallback(
     DispatchQueue.main.async { controller.evaluate() }
 }
 
+// MARK: - Screen mode
+
+enum ScreenMode: String, CaseIterable, Identifiable {
+    case laptopOnly
+    case externalOnly
+    case both
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .laptopOnly: return "Ноутбук"
+        case .externalOnly: return "Монитор"
+        case .both: return "Оба"
+        }
+    }
+}
+
 // MARK: - Controller
 
 final class DisplayController: ObservableObject {
-    /// True only while *this app* is the reason the internal display is off,
-    /// so we never fight the user if they turn it off some other way.
-    @Published private(set) var isInternalDisabled = false
+    /// The mode the user (or the automatic mode) asked for.
+    @Published private(set) var mode: ScreenMode = .both
+    /// Number of external displays that are connected (including ones this app switched off).
     @Published private(set) var externalCount = 0
+    /// True when the built-in display is currently not showing anything.
+    @Published private(set) var internalIsOff = false
+    @Published private(set) var lastError: String? = nil
 
-    /// User-facing switch. When off, the app never acts automatically —
-    /// but manual toggling and the safety net still work.
+    /// When on, a newly connected external display automatically becomes the
+    /// only active screen.
     @Published var autoModeEnabled: Bool {
         didSet {
             UserDefaults.standard.set(autoModeEnabled, forKey: "AutoModeEnabled")
-            if autoModeEnabled {
-                evaluate()
-            } else if isInternalDisabled {
-                enableInternal()
+            if autoModeEnabled && externalCount > 0 && mode == .both {
+                select(.externalOnly)
             }
         }
     }
 
-    private var cachedInternalID: CGDirectDisplayID?
-    private var pendingWorkItem: DispatchWorkItem?
+    private struct Snapshot {
+        var internalOn: Bool
+        var externalsOn: [CGDirectDisplayID]
+        var externalsOff: [CGDirectDisplayID]
+
+        /// The mode that matches what the displays are doing right now.
+        var derivedMode: ScreenMode {
+            if !internalOn && !externalsOn.isEmpty { return .externalOnly }
+            if internalOn && externalsOn.isEmpty && !externalsOff.isEmpty { return .laptopOnly }
+            return .both
+        }
+    }
+
+    private var internalID: CGDirectDisplayID?
+    /// Displays this app has switched off (persisted for crash recovery).
+    private var offByUs = Set<CGDirectDisplayID>()
+    /// External displays seen at the last check, to detect newly connected ones.
+    private var knownExternals = Set<CGDirectDisplayID>()
+    private var lastApply = Date.distantPast
+    private var pendingWork: DispatchWorkItem?
     private var safetyTimer: DispatchSourceTimer?
+    private var isSleeping = false
+    private var observers: [NSObjectProtocol] = []
 
     init() {
         self.autoModeEnabled = UserDefaults.standard.object(forKey: "AutoModeEnabled") as? Bool ?? true
     }
 
+    // MARK: Lifecycle
+
     func start() {
-        cachedInternalID = internalDisplayID()
+        recoverFromPreviousSession()
+
         let observer = Unmanaged.passUnretained(self).toOpaque()
         CGDisplayRegisterReconfigurationCallback(reconfigurationCallback, observer)
-        startSafetyTimer()
+
+        let center = NSWorkspace.shared.notificationCenter
+        observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.isSleeping = true
+        })
+        observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.isSleeping = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.evaluate() }
+        })
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 15, repeating: 15)
+        timer.setEventHandler { [weak self] in self?.evaluate() }
+        timer.resume()
+        safetyTimer = timer
+
         evaluate()
     }
 
     func stop() {
         let observer = Unmanaged.passUnretained(self).toOpaque()
         CGDisplayRemoveReconfigurationCallback(reconfigurationCallback, observer)
+        for token in observers {
+            NSWorkspace.shared.notificationCenter.removeObserver(token)
+        }
+        observers.removeAll()
         safetyTimer?.cancel()
-        restoreIfNeeded(reason: "quit")
+        pendingWork?.cancel()
+        restoreAll()
     }
 
-    /// Re-checks the current display arrangement and, if auto mode is on,
-    /// disables/enables the internal display accordingly. The safety
-    /// restore (external gone -> bring internal back) always runs,
-    /// regardless of the auto-mode switch. Safe to call as often as you like.
-    func evaluate() {
-        guard let internalID = internalDisplayID() ?? cachedInternalID else { return }
-        cachedInternalID = internalID
-        let externals = externalDisplayCount(excluding: internalID)
-        externalCount = externals
-
-        pendingWorkItem?.cancel()
-
-        if externals == 0 && isInternalDisabled {
-            enableInternal()
-        } else if autoModeEnabled && externals > 0 && !isInternalDisabled {
-            // Give macOS ~1.5s to finish settling the new monitor's mode
-            // before we pull the internal display out from under it.
-            let work = DispatchWorkItem { [weak self] in self?.disableInternal() }
-            pendingWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
-        }
-    }
-
-    /// Manual "toggle now" button: works even when auto mode is off, but
-    /// still refuses to disable the internal display with no external one.
-    func manualToggle() {
-        guard let id = internalDisplayID() ?? cachedInternalID else { return }
-        cachedInternalID = id
-        pendingWorkItem?.cancel()
-        if isInternalDisabled {
-            enableInternal()
-        } else {
-            guard externalDisplayCount(excluding: id) > 0 else { return }
-            disableInternal()
-        }
-    }
-
-    private func disableInternal() {
-        guard let id = cachedInternalID else { return }
-        // Re-check right before acting: the user may have unplugged again
-        // during the settle delay.
-        guard externalDisplayCount(excluding: id) > 0, !isInternalDisabled else { return }
-        if setDisplay(id, enabled: false) {
-            isInternalDisabled = true
-            NSLog("AutoDisplayOff: internal display disabled")
-        } else {
-            NSLog("AutoDisplayOff: failed to disable internal display")
-        }
-    }
-
-    private func enableInternal() {
-        guard let id = cachedInternalID else { return }
-        if setDisplay(id, enabled: true) {
-            NSLog("AutoDisplayOff: internal display re-enabled")
-        } else {
-            NSLog("AutoDisplayOff: failed to re-enable internal display (will keep retrying)")
-        }
-        // Always clear the flag even on failure: we'd rather retry "enable"
-        // again from a clean slate than get stuck believing it's off.
-        isInternalDisabled = false
-    }
-
-    /// Safety net: called on quit and every 15s. If we believe the internal
-    /// display is off but no external display is actually present, force it
-    /// back on so the user is never left with a blank laptop screen.
-    private func restoreIfNeeded(reason: String) {
-        guard isInternalDisabled, let id = cachedInternalID else { return }
-        if externalDisplayCount(excluding: id) == 0 {
-            NSLog("AutoDisplayOff: safety restore (\(reason))")
+    /// If a previous run was killed while some display was switched off,
+    /// switch it back on before doing anything else.
+    private func recoverFromPreviousSession() {
+        guard let saved = StateStore.load() else { return }
+        internalID = saved.internalID
+        for id in saved.offByUs {
             setDisplay(id, enabled: true)
-            isInternalDisabled = false
+        }
+        StateStore.save(SavedState(internalID: internalID, offByUs: []))
+    }
+
+    private func persist() {
+        StateStore.save(SavedState(internalID: internalID, offByUs: Array(offByUs)))
+    }
+
+    // MARK: Public actions
+
+    /// Called by the UI: apply the chosen mode right away.
+    func select(_ newMode: ScreenMode) {
+        pendingWork?.cancel()
+        pendingWork = nil
+        let s = snapshot()
+        knownExternals = Set(s.externalsOn + s.externalsOff)
+        mode = newMode
+        lastError = nil
+        act()
+    }
+
+    /// Called on every display change and every 15 s. Debounced: the real work
+    /// happens ~1.5 s after the last event, once macOS has settled.
+    func evaluate() {
+        refreshStatus()
+        pendingWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.act() }
+        pendingWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    // MARK: Core logic
+
+    private func act() {
+        pendingWork = nil
+        guard !isSleeping else { return }
+        let s = snapshot()
+
+        // 1. Safety net: built-in is off but no external display is left.
+        if let id = internalID, offByUs.contains(id), s.externalsOn.isEmpty {
+            NSLog("AutoDisplayOff: no external display left, restoring all displays")
+            restoreAll()
+            mode = .both
+            lastError = nil
+            knownExternals = []
+            refreshStatus()
+            return
+        }
+
+        // 2. A new external display appeared.
+        let newOnes = Set(s.externalsOn).subtracting(knownExternals)
+        knownExternals = Set(s.externalsOn + s.externalsOff)
+        if !newOnes.isEmpty {
+            mode = autoModeEnabled ? .externalOnly : .both
+        }
+
+        // 3. Make the displays match the wanted mode.
+        if mode != s.derivedMode {
+            apply(mode, from: s)
+        }
+        refreshStatus()
+    }
+
+    /// Switches displays so that they match `target`. Always turns displays ON
+    /// first and OFF afterwards, and never turns off the last working display.
+    private func apply(_ target: ScreenMode, from s: Snapshot) {
+        guard let internalID = internalID else {
+            lastError = "Встроенный экран не найден"
+            mode = s.derivedMode
+            return
+        }
+        var failed = false
+        var touched = false
+        var enabledNow = Set<CGDirectDisplayID>()
+
+        // Step 1: turn ON what must be on.
+        let candidates: [CGDirectDisplayID]
+        switch target {
+        case .both: candidates = Array(offByUs)
+        case .laptopOnly: candidates = [internalID]
+        case .externalOnly: candidates = Array(offByUs.filter { $0 != internalID })
+        }
+        let toEnable = candidates
+            .filter { id in
+                guard offByUs.contains(id) else { return false }
+                return id == internalID ? !s.internalOn : !s.externalsOn.contains(id)
+            }
+            .sorted { a, b in a == internalID && b != internalID }
+
+        for id in toEnable {
+            touched = true
+            if setDisplay(id, enabled: true) {
+                offByUs.remove(id)
+                enabledNow.insert(id)
+            } else if id == internalID {
+                failed = true
+            } else {
+                // Probably the monitor was unplugged while it was switched off.
+                offByUs.remove(id)
+            }
+        }
+
+        // Step 2: turn OFF what must be off — only if something else stays on.
+        let internalOnNow = s.internalOn || enabledNow.contains(internalID)
+        let externalsOnNow = Set(s.externalsOn).union(enabledNow.filter { $0 != internalID })
+
+        switch target {
+        case .both:
+            break
+        case .laptopOnly:
+            if internalOnNow {
+                for id in s.externalsOn {
+                    touched = true
+                    if setDisplay(id, enabled: false) {
+                        offByUs.insert(id)
+                    } else {
+                        failed = true
+                    }
+                }
+            } else {
+                failed = true
+            }
+        case .externalOnly:
+            if externalsOnNow.isEmpty {
+                lastError = "Внешний монитор не найден"
+                failed = true
+            } else if internalOnNow {
+                touched = true
+                if setDisplay(internalID, enabled: false) {
+                    offByUs.insert(internalID)
+                } else {
+                    failed = true
+                }
+            }
+        }
+
+        if touched { lastApply = Date() }
+        if target == .both && !failed { offByUs.removeAll() }
+        persist()
+
+        if failed {
+            mode = s.derivedMode
+            if lastError == nil { lastError = "Не удалось переключить экран" }
+        } else {
+            lastError = nil
         }
     }
 
-    private func startSafetyTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 15, repeating: 15)
-        timer.setEventHandler { [weak self] in self?.restoreIfNeeded(reason: "periodic safety check") }
-        timer.resume()
-        safetyTimer = timer
+    /// Switches every display this app has turned off back on.
+    private func restoreAll() {
+        let ids = offByUs.sorted { a, b in a == internalID && b != internalID }
+        for id in ids {
+            setDisplay(id, enabled: true)
+        }
+        offByUs.removeAll()
+        lastApply = Date()
+        persist()
+    }
+
+    // MARK: Snapshot / status
+
+    private func isOn(_ id: CGDirectDisplayID, online: [CGDirectDisplayID]) -> Bool {
+        guard online.contains(id) else { return false }
+        guard offByUs.contains(id) else { return true }
+        // Switched off by us: only believe "active" once things have settled
+        // (macOS itself turns displays back on, e.g. after wake).
+        return CGDisplayIsActive(id) != 0 && Date().timeIntervalSince(lastApply) > 3
+    }
+
+    private func snapshot() -> Snapshot {
+        let online = onlineDisplayIDs()
+        if let builtin = online.first(where: { CGDisplayIsBuiltin($0) != 0 }), builtin != internalID {
+            internalID = builtin
+            persist()
+        }
+        let internalOn = internalID.map { isOn($0, online: online) } ?? false
+        let externalsOn = online.filter { CGDisplayIsBuiltin($0) == 0 && isOn($0, online: online) }
+        let externalsOff = Array(offByUs.filter { $0 != internalID && !isOn($0, online: online) })
+        return Snapshot(internalOn: internalOn, externalsOn: externalsOn, externalsOff: externalsOff)
+    }
+
+    private func refreshStatus() {
+        let s = snapshot()
+        externalCount = s.externalsOn.count + s.externalsOff.count
+        internalIsOff = !s.internalOn
     }
 }
 
@@ -254,9 +448,9 @@ struct ContentView: View {
 
             HStack(spacing: 6) {
                 Circle()
-                    .fill(controller.isInternalDisabled ? Color.red : Color.green)
+                    .fill(controller.internalIsOff ? Color.red : Color.green)
                     .frame(width: 8, height: 8)
-                Text(controller.isInternalDisabled ? "Встроенный экран выключен" : "Встроенный экран включён")
+                Text(controller.internalIsOff ? "Экран ноутбука выключен" : "Экран ноутбука включён")
                     .font(.subheadline)
             }
 
@@ -268,20 +462,44 @@ struct ContentView: View {
 
             Divider()
 
+            Text("Какой экран использовать")
+                .font(.subheadline)
+
+            Picker("", selection: Binding(
+                get: { controller.mode },
+                set: { controller.select($0) }
+            )) {
+                ForEach(ScreenMode.allCases) { screenMode in
+                    Text(screenMode.title).tag(screenMode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(controller.externalCount == 0)
+
+            if controller.externalCount == 0 {
+                Text("Подключите внешний монитор, чтобы выбрать экран.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let error = controller.lastError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Toggle(isOn: Binding(
                 get: { controller.autoModeEnabled },
                 set: { controller.autoModeEnabled = $0 }
             )) {
-                Text("Автовыключение при подключении монитора")
+                Text("При подключении монитора переключаться на него")
                     .font(.system(size: 13))
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .toggleStyle(.switch)
-
-            Button(controller.isInternalDisabled ? "Включить сейчас" : "Выключить сейчас") {
-                controller.manualToggle()
-            }
-            .disabled(!controller.isInternalDisabled && controller.externalCount == 0)
-            .frame(maxWidth: .infinity)
 
             Divider()
 
@@ -289,7 +507,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
         }
         .padding(16)
-        .frame(width: 280)
+        .frame(width: 300)
     }
 }
 
@@ -300,6 +518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var cancellables = Set<AnyCancellable>()
+    private var signalSources: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // no Dock icon, menu bar only
@@ -320,14 +539,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover = NSPopover()
         popover.behavior = .transient
         popover.delegate = self
-        popover.contentSize = NSSize(width: 280, height: 260)
+        popover.contentSize = NSSize(width: 300, height: 300)
         popover.contentViewController = hosting
 
-        controller.$isInternalDisabled
+        controller.$mode
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateIcon() }
+            .store(in: &cancellables)
+        controller.$internalIsOff
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.updateIcon() }
             .store(in: &cancellables)
 
+        installSignalHandlers()
         controller.start()
     }
 
@@ -335,12 +559,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         controller.stop()
     }
 
+    /// `pkill`, logout and launchd send SIGTERM: quit properly so that
+    /// every display is switched back on.
+    private func installSignalHandlers() {
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
+            _ = signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler { NSApp.terminate(nil) }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
     private func updateIcon() {
         guard let button = statusItem.button else { return }
         let image = NSImage(systemSymbolName: "display", accessibilityDescription: "AutoDisplayOff")
         image?.isTemplate = true
         button.image = image
-        button.contentTintColor = controller.isInternalDisabled ? .systemRed : nil
+        switch controller.mode {
+        case .externalOnly: button.contentTintColor = .systemRed
+        case .laptopOnly: button.contentTintColor = .systemOrange
+        case .both: button.contentTintColor = nil
+        }
     }
 
     @objc private func togglePopover() {
